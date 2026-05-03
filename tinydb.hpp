@@ -70,6 +70,7 @@ struct IndexEntry {
 
 /* Cross-platform mmap wrapper */
 class MappedFile {
+public:
     MappedFile() = default;
     ~MappedFile() { close(); }
 
