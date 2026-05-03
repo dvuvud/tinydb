@@ -4,11 +4,22 @@
 #include <cstdint>
 #include <cstring>
 #include <span>
+#include <string_view>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace tinydb {
 
 // --- public types ---
- 
+
 /* Raw byte view into mmap'd file */
 using Bytes = std::span<const std::byte>;
 
@@ -55,6 +66,163 @@ inline EntryHeader decode_header(const uint8_t in[HEADER_SIZE]) noexcept {
 struct IndexEntry {
     size_t val_offset;  // byte offset of value data in file
     uint32_t val_len;
+};
+
+/* Cross-platform mmap wrapper */
+class MappedFile {
+    MappedFile() = default;
+    ~MappedFile() { close(); }
+
+    MappedFile(const MappedFile&)            = delete;
+    MappedFile& operator=(const MappedFile&) = delete;
+
+    bool open(std::string_view path) {
+        path_ = path;
+#ifdef _WIND32
+        file_ = CreateFileA(path_.c_str(),
+                            GENERIC_READ | GENERIC_WRITE,
+                            FILE_SHARE_READ, nullptr,
+                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file_ == INVALID_HANDLE_VALUE) {
+            return false;:
+        }
+#else
+        fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT, 0644);
+        if (fd_ < 0) {
+            return false;
+        }
+#endif
+        return remap();
+    }
+
+    void close() {
+        unmap();
+#ifdef _WIN32
+        if (file_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(file_);
+            file_ = INVALID_HANDLE_VALUE;
+        }
+#else
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+#endif
+    }
+
+    bool remap() {
+        unmap();
+        size_ = file_size();
+        if (size_ == 0) {
+            return true;
+        }
+
+#ifdef _WIN32
+        map_ = CreateFileMappingA(file_, nullptr, PAGE_READWRITE, 0, 0, nullptr);
+
+        if (!map_) {
+            return false;
+        }
+
+        ptr_ = static_cast<uint8_t*>(MapViewOfFile(map_, FILE_MAP_ALL_ACCESS, 0, 0, size_));
+
+        if (!ptr_) {
+            CloseHandle(map_);
+            map_ = nullptr;
+            return false;
+        }
+#else
+        ptr_ = static_cast<uint8_t*>(::mmap(nullptr, size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0));
+
+        if (ptr_ == MAP_FAILED) {
+            ptr_ = nullptr;
+            return false;
+        }
+#endif
+        return true;
+    }
+
+    bool append(const void* data, size_t len) {
+        if (len == 0) {
+            return true;
+        }
+#ifdef _WIN32
+        DWORD written = 0;
+        SetFilePointer(file_, 0, nullptr, FILE_END);
+        return WriteFile(file_, data, static_cast<DWORD>(len), &written, nullptr)
+        && written == static_cast<DWORD>(len);
+#else
+        return ::write(fd_, data, len) == static_cast<ssize_t>(len);
+#endif
+    }
+
+    void sync() {
+#ifdef _WIN32
+        FlushFileBuffers(file_);
+#else
+        ::fsync(fd_);
+#endif
+    }
+
+    bool rewrite(const std::vector<uint8_t>& data) {
+        unmap();
+#ifdef _WIN32
+        SetFilePointer(file_, 0, nullptr, FILE_BEGIN);
+        SetEndOfFile(file_);
+        DWORD written = 0;
+        if (!WriteFile(file_, data.data(), static_cast<DWORD>(data.size()),
+                       &written, nullptr)) {
+            return false;
+        }
+        FlushFileBuffers(file_);
+#else
+        if (::ftruncate(fd_, 0) < 0) return false;
+        ::lseek(fd_, 0, SEEK_SET);
+        if (::write(fd_, data.data(), data.size())
+            != static_cast<ssize_t>(data.size()))
+            return false;
+        ::fsync(fd_);
+#endif
+        return remap();
+    }
+
+    const uint8_t* ptr()  const noexcept { return ptr_;  }
+    size_t         size() const noexcept { return size_; }
+
+private:
+    void unmap() {
+        if (!ptr_) return;
+#ifdef _WIN32
+        UnmapViewOfFile(ptr_);
+        if (map_) { CloseHandle(map_); map_ = nullptr; }
+#else
+        ::munmap(ptr_, size_);
+#endif
+        ptr_  = nullptr;
+        size_ = 0;
+    }
+
+    size_t file_size() const noexcept {
+#ifdef _WIN32
+        LARGE_INTEGER sz{};
+        GetFileSizeEx(file_, &sz);
+        return static_cast<size_t>(sz.QuadPart);
+#else
+        struct stat st{};
+        ::fstat(fd_, &st);
+        return static_cast<size_t>(st.st_size);
+#endif
+    }
+
+#ifdef _WIN32
+    HANDLE file_ = INVALID_HANDLE_VALUE;
+    HANDLE map_  = nullptr;
+#else
+    int fd_ = -1;
+#endif
+    uint8_t*    ptr_  = nullptr;
+    size_t      size_ = 0;
+    std::string path_;
 };
 }
 }
