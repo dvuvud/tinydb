@@ -9,6 +9,11 @@
 #include <span>
 #include <functional>
 #include <string_view>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include <type_traits>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -83,7 +88,7 @@ public:
 
     bool open(std::string_view path) {
         path_ = path;
-#ifdef _WIND32
+#ifdef _WIN32
         file_ = CreateFileA(path_.c_str(),
                             GENERIC_READ | GENERIC_WRITE,
                             FILE_SHARE_READ, nullptr,
