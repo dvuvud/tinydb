@@ -314,18 +314,52 @@ private:
 
 // --- transaction ---
 
-class DB;
+class DB;   // forward declaration
 
+/**
+ * @brief A staged batch of write operations, used inside DB::transaction().
+ *
+ * A @p Tx is constructed by DB::transaction() and passed to the callback.
+ * Operations staged on it are only applied to the database if the
+ * callback returns @p tinydb::commit. They are discarded on
+ * @p tinydb::rollback or if the callback throws.
+ *
+ * @note Do not construct a @p Tx directly, use DB::transaction().
+ *
+ * @see DB::transaction()
+ */
 class Tx {
 public:
-    /* Store a string value */
+    /**
+     * @brief Stage a string value to be written.
+     *
+     * @param key   The key to write (max 255 bytes).
+     * @param value The string value to store.
+     */
     void put(std::string_view key, std::string_view value) {
         ops_.push_back({ std::string(key),
                          std::vector<uint8_t>(value.begin(), value.end()),
                          false });
     }
 
-    /* Store any trivially copyable, non-string type */
+     /**
+     * @brief Stage a trivially copyable value to be written.
+     *
+     * Accepts any type that satisfies `std::is_trivially_copyable`, except
+     * types convertible to `std::string_view` (those go through the string
+     * overload above).
+     *
+     * @tparam T    Any trivially copyable type: int, float, struct, etc.
+     * @param key   The key to write (max 255 bytes).
+     * @param value The value to store. Stored as raw bytes via memcpy.
+     *
+     * @par Example
+     * @code
+     *   struct Point { float x, y; };
+     *   tx.put("origin", Point{0.0f, 0.0f});
+     *   tx.put("count",  int32_t{42});
+     * @endcode
+     */
     template <typename T>
         requires (std::is_trivially_copyable_v<T>
                && !std::is_convertible_v<T, std::string_view>)
@@ -336,7 +370,14 @@ public:
                          false });
     }
 
-    /* Mark a key for deletion */
+    /**
+     * @brief Stage a key deletion.
+     *
+     * If the key does not exist in the database, this is a no-op when the
+     * transaction is committed.
+     *
+     * @param key The key to delete.
+     */
     void remove(std::string_view key) {
         ops_.push_back({ std::string(key), {}, true });
     }
