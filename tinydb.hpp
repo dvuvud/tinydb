@@ -85,7 +85,7 @@ public:
                             FILE_SHARE_READ, nullptr,
                             OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file_ == INVALID_HANDLE_VALUE) {
-            return false;:
+            return false;
         }
 #else
         fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT, 0644);
