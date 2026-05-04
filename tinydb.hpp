@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cassert>
+#include <stdexcept>
+#include <mutex>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -225,5 +228,31 @@ private:
     size_t      size_ = 0;
     std::string path_;
 };
-}
-}
+}   // namespace detail
+
+class DB {
+public:
+    explicit DB(std::string_view path) {
+        if (!file_.open(path)) {
+            throw std::runtime_error("tinydb: failed to open '" + std::string(path) + "'");
+        }
+
+        if (file_.size() == 0) {
+            init_file();
+        }
+        else {
+            load_index();
+        }
+    }
+ 
+    ~DB() = default;
+    DB(const DB&)            = delete;
+    DB& operator=(const DB&) = delete;
+ 
+private:
+    detail::MappedFile file_;
+    std::unordered_map<std::string, detail::IndexEntry> index_;
+    mutable std::mutex mu_;
+};
+
+}   // namespace tinydb
