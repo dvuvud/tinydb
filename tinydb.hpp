@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <span>
+#include <functional>
 #include <string_view>
 
 #ifdef _WIN32
@@ -315,6 +316,35 @@ public:
     [[nodiscard]] bool has(std::string_view key) const {
         std::lock_guard lock(mu_);
         return index_.contains(std::string(key));
+    }
+
+    /**
+     * Iterate all live keys. Callback receives (key, raw_bytes)
+     * Use Bytes::data() and Bytes::size() to access the value bytes.
+     */
+    void each(std::function<void(std::string_view, Bytes)> fn) {
+        std::lock_guard lock(mu_);
+        for (const auto& [key, entry] : index_) {
+            auto* ptr = reinterpret_cast<const std::byte*>(file_.ptr() + entry.val_offset);
+            fn(key, Bytes{ ptr, entry.val_len });
+        }
+    }
+
+    /**
+     * Iterate only keys that start with the given prefix.
+     *
+     *  db.put("user:rick", ...);
+     *  db.put("user:john",   ...);
+     *  db.prefix("user:", [](auto key, auto val) { ... });
+     */
+    void prefix(std::string_view pfx, std::function<void(std::string_view, Bytes)> fn) {
+        std::lock_guard lock(mu_);
+        for (const auto& [key, entry] : index_) {
+            if (key.starts_with(pfx)) {
+                auto* ptr = reinterpret_cast<const std::byte*>(file_.ptr() + entry.val_offset);
+                fn(key, Bytes{ ptr, entry.val_len });
+            }
+        }
     }
 
 private:
