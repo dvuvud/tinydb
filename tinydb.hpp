@@ -32,6 +32,9 @@ namespace tinydb {
 /* Raw byte view into mmap'd file */
 using Bytes = std::span<const std::byte>;
 
+/* Return value from a transaction lambda */
+enum TxResult { commit, rollback };
+
 // --- internal ---
 
 namespace detail {
@@ -392,6 +395,33 @@ public:
                 fn(key, Bytes{ ptr, entry.val_len });
             }
         }
+    }
+
+    /**
+     * Execute a batch of operations atomically and
+     * return tinydb::commit to apply, tinydb::rollback to discard
+     *
+     *    db.transaction([&](tinydb::Tx& tx) {
+     *        tx.put("a", 1);
+     *        tx.put("b", 2);
+     *        return tinydb::commit;
+     *    });
+     */
+    void transaction(std::function<TxResult(Tx&)> fn) {
+        Tx tx;
+        TxResult result = fn(tx);
+        if (result == rollback) return;
+
+        std::lock_guard lock(mu_);
+        for (const auto& op : tx.ops_) {
+            append_entry(
+                op.key,
+                op.is_delete ? nullptr : op.val.data(),
+                op.is_delete ? 0       : op.val.size(),
+                op.is_delete
+            );
+        }
+        file_.sync();
     }
 
     /**
