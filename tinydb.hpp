@@ -250,6 +250,89 @@ public:
     DB& operator=(const DB&) = delete;
  
 private:
+ 
+    /* Write the magic header to a brand-new file */
+    void init_file() {
+        file_.append(detail::MAGIC, sizeof(detail::MAGIC));
+        file_.remap();
+    }
+ 
+    /**
+     * Scan the on-disk log and rebuild the in-memory index
+     * Called once on open. Last write for a given key wins
+     */
+    void load_index() {
+        if (file_.size() < sizeof(detail::MAGIC)) {
+            throw std::runtime_error("tinydb: file too small to be valid");
+        }
+ 
+        if (std::memcmp(file_.ptr(), detail::MAGIC, sizeof(detail::MAGIC)) != 0) {
+            throw std::runtime_error("tinydb: bad magic. File was not created by tinydb");
+        }
+ 
+        size_t pos = sizeof(detail::MAGIC);
+ 
+        while (pos + detail::HEADER_SIZE <= file_.size()) {
+            uint8_t raw[detail::HEADER_SIZE];
+            std::memcpy(raw, file_.ptr() + pos, detail::HEADER_SIZE);
+            detail::EntryHeader hdr = detail::decode_header(raw);
+            pos += detail::HEADER_SIZE;
+ 
+            if (pos + hdr.key_len + hdr.val_len > file_.size()) {
+                break;
+            }
+ 
+            std::string key(
+                reinterpret_cast<const char*>(file_.ptr() + pos),
+                hdr.key_len
+            );
+            pos += hdr.key_len;
+ 
+            if (hdr.flags == detail::FLAG_TOMB) {
+                index_.erase(key);
+            } else {
+                index_[key] = { pos, hdr.val_len };
+            }
+ 
+            pos += hdr.val_len;
+        }
+    }
+ 
+    /**
+     * Append one entry to the file and update the in-memory index_
+     * @note Caller must hold mu_
+     */
+    void append_entry(std::string_view key,
+                      const uint8_t* val,
+                      uint32_t val_len,
+                      bool tombstone) {
+        assert(key.size() <= detail::MAX_KEY && "tinydb: key exceeds 255-byte limit");
+ 
+        detail::EntryHeader hdr{
+            .flags   = tombstone ? detail::FLAG_TOMB : detail::FLAG_LIVE,
+            .key_len = static_cast<uint8_t>(key.size()),
+            .val_len = val_len,
+        };
+ 
+        uint8_t raw[detail::HEADER_SIZE];
+        detail::encode_header(raw, hdr);
+ 
+        file_.append(raw, detail::HEADER_SIZE);
+        file_.append(key.data(), key.size());
+        if (val && val_len) {
+            file_.append(val, val_len);
+        }
+        file_.remap();
+ 
+        if (tombstone) {
+            index_.erase(std::string(key));
+        } else {
+            // Bytes were appended last so offset is file size - value length
+            size_t val_off = file_.size() - val_len;
+            index_[std::string(key)] = { val_off, val_len };
+        }
+    }
+ 
     detail::MappedFile file_;
     std::unordered_map<std::string, detail::IndexEntry> index_;
     mutable std::mutex mu_;
