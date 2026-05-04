@@ -244,19 +244,87 @@ public:
             load_index();
         }
     }
- 
+
     ~DB() = default;
     DB(const DB&)            = delete;
     DB& operator=(const DB&) = delete;
- 
+
+    /* Store a string value */
+    void put(std::string_view key, std::string_view value) {
+        std::lock_guard lock(mu_);
+        append_entry(
+            key,
+            reinterpret_cast<const uint8_t*>(value.data()),
+            static_cast<uint32_t>(value.size()),
+            false
+        );
+    }
+
+    /* Store any trivially copyable, non-string type (int, float, struct, ...) */
+    template <typename T>
+        requires (std::is_trivially_copyable_v<T>
+               && !std::is_convertible_v<T, std::string_view>)
+    void put(std::string_view key, const T& value) {
+        std::lock_guard lock(mu_);
+        append_entry(
+            key,
+            reinterpret_cast<const uint8_t*>(&value),
+            static_cast<uint32_t>(sizeof(T)),
+            false
+        );
+    }
+
+    /**
+     * Retrieve a value.
+     * Returns std::nullopt if the key doesn't exist
+     */
+    template <typename T = std::string>
+    std::optional<T> get(std::string_view key) const {
+        std::lock_guard lock(mu_);
+        auto it = index_.find(std::string(key));
+        if (it == index_.end()) {
+            return std::nullopt;
+        }
+
+        const auto& entry = it->second;
+
+        if constexpr (std::is_same_v<T, std::string>) {
+            const auto* ptr = file_.ptr() + entry.val_offset;
+            return std::string(reinterpret_cast<const char*>(ptr), entry.val_len);
+        } else {
+            static_assert(std::is_trivially_copyable_v<T>, "tinydb: T must be trivially copyable");
+            if (entry.val_len != static_cast<uint32_t>(sizeof(T))) {
+                return std::nullopt;
+            }
+            T result;
+            std::memcpy(&result, file_.ptr() + entry.val_offset, sizeof(T));
+            return result;
+        }
+    }
+
+    /* Remove a key. Does nothing if the key doesn't exist */
+    void remove(std::string_view key) {
+        std::lock_guard lock(mu_);
+        if (!index_.contains(std::string(key))) {
+            return;
+        }
+        append_entry(key, nullptr, 0, true);
+    }
+
+    /* Returns true if the key exists */
+    [[nodiscard]] bool has(std::string_view key) const {
+        std::lock_guard lock(mu_);
+        return index_.contains(std::string(key));
+    }
+
 private:
- 
+
     /* Write the magic header to a brand-new file */
     void init_file() {
         file_.append(detail::MAGIC, sizeof(detail::MAGIC));
         file_.remap();
     }
- 
+
     /**
      * Scan the on-disk log and rebuild the in-memory index
      * Called once on open. Last write for a given key wins
@@ -265,39 +333,39 @@ private:
         if (file_.size() < sizeof(detail::MAGIC)) {
             throw std::runtime_error("tinydb: file too small to be valid");
         }
- 
+
         if (std::memcmp(file_.ptr(), detail::MAGIC, sizeof(detail::MAGIC)) != 0) {
             throw std::runtime_error("tinydb: bad magic. File was not created by tinydb");
         }
- 
+
         size_t pos = sizeof(detail::MAGIC);
- 
+
         while (pos + detail::HEADER_SIZE <= file_.size()) {
             uint8_t raw[detail::HEADER_SIZE];
             std::memcpy(raw, file_.ptr() + pos, detail::HEADER_SIZE);
             detail::EntryHeader hdr = detail::decode_header(raw);
             pos += detail::HEADER_SIZE;
- 
+
             if (pos + hdr.key_len + hdr.val_len > file_.size()) {
                 break;
             }
- 
+
             std::string key(
                 reinterpret_cast<const char*>(file_.ptr() + pos),
                 hdr.key_len
             );
             pos += hdr.key_len;
- 
+
             if (hdr.flags == detail::FLAG_TOMB) {
                 index_.erase(key);
             } else {
                 index_[key] = { pos, hdr.val_len };
             }
- 
+
             pos += hdr.val_len;
         }
     }
- 
+
     /**
      * Append one entry to the file and update the in-memory index_
      * @note Caller must hold mu_
@@ -307,13 +375,13 @@ private:
                       uint32_t val_len,
                       bool tombstone) {
         assert(key.size() <= detail::MAX_KEY && "tinydb: key exceeds 255-byte limit");
- 
+
         detail::EntryHeader hdr{
             .flags   = tombstone ? detail::FLAG_TOMB : detail::FLAG_LIVE,
             .key_len = static_cast<uint8_t>(key.size()),
             .val_len = val_len,
         };
- 
+
         uint8_t raw[detail::HEADER_SIZE];
         detail::encode_header(raw, hdr);
  
@@ -323,7 +391,7 @@ private:
             file_.append(val, val_len);
         }
         file_.remap();
- 
+
         if (tombstone) {
             index_.erase(std::string(key));
         } else {
@@ -332,7 +400,7 @@ private:
             index_[std::string(key)] = { val_off, val_len };
         }
     }
- 
+
     detail::MappedFile file_;
     std::unordered_map<std::string, detail::IndexEntry> index_;
     mutable std::mutex mu_;
