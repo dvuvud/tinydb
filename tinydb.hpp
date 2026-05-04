@@ -347,6 +347,65 @@ public:
         }
     }
 
+    /**
+     * Rewrite the file by retaining only live entries and reclaiming space from
+     * deleted and overwritten ones. Blocks all reads and writes while running.
+     * Safe to call at any time.
+     */
+    void compact() {
+        std::lock_guard lock(mu_);
+
+        std::vector<uint8_t> buf;
+        buf.reserve(file_.size());
+
+        buf.insert(
+            buf.end(),
+            detail::MAGIC,
+            detail::MAGIC + sizeof(detail::MAGIC)
+        );
+
+        // Serialise all live entries and track their new offsets
+        std::unordered_map<std::string, detail::IndexEntry> new_index;
+        for (const auto& [key, entry] : index_) {
+            detail::EntryHeader hdr{
+                .flags   = detail::FLAG_LIVE,
+                .key_len = static_cast<uint8_t>(key.size()),
+                .val_len = entry.val_len,
+            };
+
+            uint8_t raw[detail::HEADER_SIZE];
+            detail::encode_header(raw, hdr);
+
+            size_t val_off = buf.size() + detail::HEADER_SIZE + key.size();
+
+            buf.insert(buf.end(), raw, raw + detail::HEADER_SIZE);
+            buf.insert(buf.end(), key.begin(), key.end());
+
+            const auto* val_ptr = file_.ptr() + entry.val_offset;
+            buf.insert(buf.end(), val_ptr, val_ptr + entry.val_len);
+
+            new_index[key] = { val_off, entry.val_len };
+        }
+
+        if (!file_.rewrite(buf)) {
+            throw std::runtime_error("tinydb: compact failed during rewrite");
+        }
+
+        index_ = std::move(new_index);
+    }
+
+    /* Number of live keys currently stored */
+    [[nodiscard]] size_t key_count() const {
+        std::lock_guard lock(mu_);
+        return index_.size();
+    }
+
+    /* Estimated file size in bytes (includes dead entries until compact()) */
+    [[nodiscard]] size_t file_size() const {
+        std::lock_guard lock(mu_);
+        return file_.size();
+    }
+
 private:
 
     /* Write the magic header to a brand-new file */
