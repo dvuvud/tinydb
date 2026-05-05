@@ -12,6 +12,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_executable(settings examples/settings.cpp)
+add_executable(cache examples/cache.cpp)
 
 option(TINYDB_BUILD_TESTS "Build the tinydb test suite" ON)
 
