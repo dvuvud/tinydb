@@ -254,5 +254,3 @@ static void BM_Transaction(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations() * n);
 }
 BENCHMARK(BM_Transaction)->Arg(100)->Arg(1000)->Arg(10000);
-
-BENCHMARK_MAIN();
