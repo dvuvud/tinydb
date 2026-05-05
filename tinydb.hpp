@@ -395,8 +395,43 @@ private:
 
 // --- DB ---
 
+/**
+ * @brief A persistent key-value database backed by a single file.
+ *
+ * Keys are UTF-8 strings up to 255 bytes. Values can be std::string,
+ * string literals, or any trivially copyable type (int, float, struct, ...).
+ *
+ * The database is safe to use from multiple threads concurrently since all public
+ * methods acquire an internal mutex.
+ *
+ * @note @p DB is non-copyable. Create one instance per file.
+ *
+ * @par Example
+ * @code
+ *   tinydb::DB db("app.db");
+ *
+ *   db.put("hits", int64_t{0});
+ *
+ *   if (auto val = db.get<int64_t>("hits")) {
+ *       std::cout << *val << std::endl;
+ *   }
+ * @endcode
+ */
 class DB {
 public:
+    /**
+     * @brief Opens or creates a database at the given path.
+     *
+     * If the file does not exist, it is created and initialised with the
+     * magic header. If it exists, it is scanned to rebuild the
+     * in-memory index.
+     *
+     * @param path Filesystem path to the database file.
+     *
+     * @throws std::runtime_error If the file cannot be opened or created.
+     * @throws std::runtime_error If the file exists but has an invalid magic
+     *         header (i.e. was not created by tinydb).
+     */
     explicit DB(std::string_view path) {
         if (!file_.open(path)) {
             throw std::runtime_error("tinydb: failed to open '" + std::string(path) + "'");
@@ -410,11 +445,24 @@ public:
         }
     }
 
+    /// @cond
     ~DB() = default;
     DB(const DB&)            = delete;
     DB& operator=(const DB&) = delete;
+    /// @endcond
 
-    /* Store a string value */
+    // --- WRITE ---
+
+    /**
+     * @brief Stores a string value under the given key.
+     *
+     * If the key already exists its value is overwritten. The write is
+     * appended to the on-disk log immediately but is not explicitly fsynced.
+     * Use transaction() if you require durability guarantees.
+     *
+     * @param key   Key to write. Must be between 1 and 255 bytes.
+     * @param value String value to store.
+     */
     void put(std::string_view key, std::string_view value) {
         std::lock_guard lock(mu_);
         append_entry(
@@ -425,7 +473,25 @@ public:
         );
     }
 
-    /* Store any trivially copyable, non-string type (int, float, struct, ...) */
+    /**
+     * @brief Stores a trivially copyable value under the given key.
+     *
+     * The value is stored as its raw bytes via `memcpy`. Overwriting a key
+     * with a value of a different size is valid. A subsequent get<T>() call
+     * will return `nullopt` if the stored size does not match `sizeof(T)`.
+     *
+     * @tparam T    Any trivially copyable type: int, float, bool, struct, etc.
+     *              Must not be implicitly convertible to std::string_view.
+     * @param key   Key to write. Must be between 1 and 255 bytes.
+     * @param value Value to store.
+     *
+     * @par Example
+     * @code
+     *   struct Config { int port; bool debug; };
+     *   db.put("cfg", Config{8080, false});
+     *   db.put("score", int32_t{100});
+     * @endcode
+     */
     template <typename T>
         requires (std::is_trivially_copyable_v<T>
                && !std::is_convertible_v<T, std::string_view>)
@@ -439,9 +505,34 @@ public:
         );
     }
 
+    // --- READ ---
+
     /**
-     * Retrieve a value.
-     * Returns std::nullopt if the key doesn't exist
+     * @brief Retrieves the value stored under the given key.
+     *
+     * Returns `std::nullopt` in two cases:
+     * - The key does not exist.
+     * - For non-string @p T: the stored byte size differs from `sizeof(T)`.
+     *
+     * The default template parameter is `std::string`, so `db.get("key")` and
+     * `db.get<std::string>("key")` are equivalent.
+     *
+     * @tparam T The type to deserialise into. Defaults to `std::string`.
+     *           Must be `std::string` or a trivially copyable type.
+     * @param key The key to look up.
+     * @return `std::optional<T>` containing the value, or `std::nullopt`.
+     *
+     * @par Example
+     * @code
+     *   auto name  = db.get("username");            // std::optional<std::string>
+     *   auto score = db.get<int32_t>("score");      // std::optional<int32_t>
+     *   auto cfg   = db.get<Config>("cfg");         // std::optional<Config>
+     *
+     *   // Idiomatic usage
+     *   if (auto v = db.get<int32_t>("score")) {
+     *       process(*v);
+     *   }
+     * @endcode
      */
     template <typename T = std::string>
     std::optional<T> get(std::string_view key) const {
@@ -467,7 +558,17 @@ public:
         }
     }
 
-    /* Remove a key. Does nothing if the key doesn't exist */
+    // --- DELETE ---
+
+    /**
+     * @brief Deletes the value stored under the given key.
+     *
+     * Appends a tombstone entry to the log and removes the key from the index.
+     * If the key does not exist this is a no-op. Space used by the old value
+     * is reclaimed the next time compact() is called.
+     *
+     * @param key The key to delete.
+     */
     void remove(std::string_view key) {
         std::lock_guard lock(mu_);
         if (!index_.contains(std::string(key))) {
@@ -476,15 +577,43 @@ public:
         append_entry(key, nullptr, 0, true);
     }
 
-    /* Returns true if the key exists */
+    // --- QUERY ---
+
+    /**
+     * @brief Returns true if the given key exists in the database.
+     *
+     * @param key The key to look up.
+     * @return `true` if the key exists, `false` otherwise.
+     */
     [[nodiscard]] bool has(std::string_view key) const {
         std::lock_guard lock(mu_);
         return index_.contains(std::string(key));
     }
 
     /**
-     * Iterate all live keys. Callback receives (key, raw_bytes)
-     * Use Bytes::data() and Bytes::size() to access the value bytes.
+     * @brief Iterates over all live key-value pairs.
+     *
+     * The callback is invoked once per key with a `string_view` of the key
+     * and a `Bytes` span pointing directly into the memory-mapped file.
+     * The iteration order is unspecified.
+     *
+     * @param fn Callback of the form `void(std::string_view key, Bytes val)`.
+     *
+     * @warning The database mutex is held for the entire duration of
+     *          iteration. Do not call any DB method from inside @p fn,
+     *          as it will deadlock. If you need to modify the database during
+     *          iteration, copy the keys out first and operate on them after.
+     *
+     * @warning The `Bytes` span is only valid for the duration of the
+     *          callback. Do not store it. Instead, copy the data if you need it later.
+     *
+     * @par Example
+     * @code
+     *   db.each([](std::string_view key, tinydb::Bytes val) {
+     *       std::string v(reinterpret_cast<const char*>(val.data()), val.size());
+     *       std::cout << key << " = " << v << "\n";
+     *   });
+     * @endcode
      */
     void each(std::function<void(std::string_view, Bytes)> fn) {
         std::lock_guard lock(mu_);
@@ -495,11 +624,34 @@ public:
     }
 
     /**
-     * Iterate only keys that start with the given prefix.
+     * @brief Iterates over all keys that begin with the given prefix.
      *
-     *  db.put("user:rick", ...);
-     *  db.put("user:john",   ...);
-     *  db.prefix("user:", [](auto key, auto val) { ... });
+     * A convenient way to implement namespaced key sets. For example, all
+     * keys stored as `"user:1001"`, `"user:1002"`, etc. can be iterated with
+     * `db.prefix("user:", fn)`.
+     *
+     * The callback and iteration order behave identically to each().
+     *
+     * @param pfx The prefix string to filter by.
+     * @param fn  Callback of the form `void(std::string_view key, Bytes val)`.
+     *
+     * @note Iteration is O(total keys), not O(matching keys), because the
+     *       underlying index is a hash map with no sorted order.
+     *
+     * @warning The database mutex is held for the entire duration of
+     *          iteration. Do not call any DB method from inside @p fn,
+     *          as it will deadlock.
+     *
+     * @par Example
+     * @code
+     *   db.put("user:james", "admin");
+     *   db.put("user:bryce",   "viewer");
+     *   db.put("config:x",   "value");
+     *
+     *   db.prefix("user:", [](std::string_view key, tinydb::Bytes val) {
+     *       // called for user:james and user:bryce only
+     *   });
+     * @endcode
      */
     void prefix(std::string_view pfx, std::function<void(std::string_view, Bytes)> fn) {
         std::lock_guard lock(mu_);
@@ -511,15 +663,42 @@ public:
         }
     }
 
+// --- TRANSACTION ---
+
     /**
-     * Execute a batch of operations atomically and
-     * return tinydb::commit to apply, tinydb::rollback to discard
+     * @brief Executes a batch of operations atomically.
      *
-     *    db.transaction([&](tinydb::Tx& tx) {
-     *        tx.put("a", 1);
-     *        tx.put("b", 2);
-     *        return tinydb::commit;
-     *    });
+     * The callback receives a Tx object on which any number of put() and
+     * remove() calls can be staged. Returning `tinydb::commit` applies all
+     * operations atomically and flushes them to disk. Returning
+     * `tinydb::rollback` discards all staged operations and the database is
+     * left completely unchanged.
+     *
+     * If the callback throws, the exception propagates to the caller and all
+     * staged operations are discarded (equivalent to rollback).
+     *
+     * @param fn A callable of the form `TxResult(Tx&)`.
+     *
+     * @par Example
+     * @code
+     *   db.transaction([](tinydb::Tx& tx) {
+     *       tx.put("balance",  int32_t{500});
+     *       tx.put("currency", std::string("USD"));
+     *       tx.remove("old_session");
+     *       return tinydb::commit;
+     *   });
+     * @endcode
+     *
+     * @par Rolling back
+     * @code
+     *   db.transaction([&](tinydb::Tx& tx) {
+     *       tx.put("x", new_value);
+     *       if (!validate(new_value)) {
+     *           return tinydb::rollback;   // nothing is written
+     *       }
+     *       return tinydb::commit;
+     *   });
+     * @endcode
      */
     void transaction(std::function<TxResult(Tx&)> fn) {
         Tx tx;
@@ -538,10 +717,32 @@ public:
         file_.sync();
     }
 
+// --- MAINTENANCE ---
+
     /**
-     * Rewrite the file by retaining only live entries and reclaiming space from
-     * deleted and overwritten ones. Blocks all reads and writes while running.
-     * Safe to call at any time.
+     * @brief Rewrites the database file retaining only live entries.
+     *
+     * The append-only log accumulates dead entries over time as keys are
+     * overwritten or deleted. `compact()` rewrites the file with only the
+     * current live values, reclaiming that space.
+     *
+     * Blocks all reads and writes for the duration of the rewrite. The
+     * database remains fully consistent. If the process is interrupted
+     * mid-compact the old file is still intact.
+     *
+     * There is no automatic compaction. Call this periodically if your
+     * workload involves many overwrites or deletions.
+     *
+     * @throws std::runtime_error If the file rewrite fails.
+     *
+     * @par Example
+     * @code
+     *   // After a batch of deletions
+     *   for (auto& key : expired_keys) {
+     *       db.remove(key);
+     *   }
+     *   db.compact();
+     * @endcode
      */
     void compact() {
         std::lock_guard lock(mu_);
@@ -555,7 +756,6 @@ public:
             detail::MAGIC + sizeof(detail::MAGIC)
         );
 
-        // Serialise all live entries and track their new offsets
         std::unordered_map<std::string, detail::IndexEntry> new_index;
         for (const auto& [key, entry] : index_) {
             detail::EntryHeader hdr{
@@ -585,29 +785,46 @@ public:
         index_ = std::move(new_index);
     }
 
-    /* Number of live keys currently stored */
+// --- DIAGNOSTICS ---
+
+    /**
+     * @brief Returns the number of live keys currently stored.
+     *
+     * @return Number of keys in the index.
+     */
     [[nodiscard]] size_t key_count() const {
         std::lock_guard lock(mu_);
         return index_.size();
     }
 
-    /* Estimated file size in bytes (includes dead entries until compact()) */
+    /**
+     * @brief Returns the current size of the database file in bytes.
+     *
+     * This includes space used by dead entries (overwritten or deleted values)
+     * that have not yet been reclaimed by compact(). It is an upper bound on
+     * the live data size.
+     *
+     * @return File size in bytes.
+     */
     [[nodiscard]] size_t file_size() const {
         std::lock_guard lock(mu_);
         return file_.size();
     }
 
 private:
-
-    /* Write the magic header to a brand-new file */
+    /// Writes the magic header to a newly created file.
     void init_file() {
         file_.append(detail::MAGIC, sizeof(detail::MAGIC));
         file_.remap();
     }
 
     /**
-     * Scan the on-disk log and rebuild the in-memory index
-     * Called once on open. Last write for a given key wins
+     * @brief Scans the on-disk log to rebuild the in-memory index.
+     *
+     * Called once during construction for existing files. Iterates every
+     * entry in the log; the last write for any given key wins. Tombstone
+     * entries remove the key from the index. A truncated entry at the tail
+     * of the file (e.g. from a crash mid-write) is silently skipped.
      */
     void load_index() {
         if (file_.size() < sizeof(detail::MAGIC)) {
@@ -647,8 +864,13 @@ private:
     }
 
     /**
-     * Append one entry to the file and update the in-memory index_
-     * @note Caller must hold mu_
+     * @brief Appends one entry to the file and updates the in-memory index.
+     *
+     * For live entries the index is updated to point at the newly written
+     * value. For tombstone entries the key is erased from the index.
+     *
+     * @pre The caller must hold @p mu_.
+     * @pre `key.size() <= detail::MAX_KEY`
      */
     void append_entry(std::string_view key,
                       const uint8_t* val,
@@ -675,7 +897,6 @@ private:
         if (tombstone) {
             index_.erase(std::string(key));
         } else {
-            // Bytes were appended last so offset is file size - value length
             size_t val_off = file_.size() - val_len;
             index_[std::string(key)] = { val_off, val_len };
         }
