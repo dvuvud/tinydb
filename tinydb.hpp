@@ -199,6 +199,8 @@ public:
     auto remap() -> bool {
         unmap();
         size_ = file_size();
+        dirty_ = false;
+        file_size_ = size_;
         if (size_ == 0) {
             return true;
         }
@@ -235,12 +237,19 @@ public:
 #ifdef _WIN32
         DWORD written = 0;
         SetFilePointer(file_, 0, nullptr, FILE_END);
-        return WriteFile(file_, data, static_cast<DWORD>(len), &written, nullptr)
-        && written == static_cast<DWORD>(len);
+        if (!WriteFile(file_, data, static_cast<DWORD>(len), &written, nullptr)
+            || written != static_cast<DWORD>(len)) {
+            return false;
+        }
 #else
         ::lseek(fd_, 0, SEEK_END);
-        return ::write(fd_, data, len) == static_cast<ssize_t>(len);
+        if (::write(fd_, data, len) != static_cast<ssize_t>(len)) {
+            return false;
+        }
 #endif
+        dirty_ = true;
+        file_size_ += len;
+        return true;
     }
 
     void sync() {
@@ -273,8 +282,13 @@ public:
         return remap();
     }
 
-    [[nodiscard]] auto ptr()  const noexcept -> const uint8_t* { return ptr_;  }
-    [[nodiscard]] auto         size() const noexcept -> size_t { return size_; }
+    [[nodiscard]] auto ptr() const noexcept -> const uint8_t* {
+        if (dirty_) {
+            const_cast<MappedFile*>(this)->remap();
+        }
+        return ptr_;
+    }
+    [[nodiscard]] auto size() const noexcept -> size_t { return file_size_; }
 
 private:
     void unmap() {
@@ -307,8 +321,10 @@ private:
 #else
     int fd_ = -1;
 #endif
-    uint8_t*    ptr_  = nullptr;
-    size_t      size_ = 0;
+    uint8_t* ptr_  = nullptr;
+    size_t size_ = 0;
+    bool dirty_ = false;
+    size_t file_size_ = 0;
     std::string path_;
 };
 }   // namespace detail
@@ -817,7 +833,6 @@ private:
     /// Writes the magic header to a newly created file.
     void init_file() {
         file_.append(detail::MAGIC, sizeof(detail::MAGIC));
-        file_.remap();
     }
 
     /**
@@ -894,7 +909,6 @@ private:
         if (val && val_len) {
             file_.append(val, val_len);
         }
-        file_.remap();
 
         if (tombstone) {
             index_.erase(std::string(key));
