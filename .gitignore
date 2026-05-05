@@ -1,0 +1,22 @@
+# binaries and outputs
+*.exe
+*.out
+*.app
+*.db
+
+# ides
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macos
+.DS_Store
+
+# logs and temp files
+*.log
+*.tmp
+
+# build output
+build/
+compile_commands.json
