@@ -104,7 +104,7 @@ using Bytes = std::span<const std::byte>;
  *
  * @see DB::transaction()
  */
-enum TxResult { commit, rollback };
+enum TxResult : uint8_t { commit, rollback };
 
 // --- internal ---
 
@@ -135,7 +135,7 @@ inline void encode_header(uint8_t out[HEADER_SIZE], const EntryHeader& h) noexce
 }
 
 /* Deserialise header from a 6-byte buffer */
-inline EntryHeader decode_header(const uint8_t in[HEADER_SIZE]) noexcept {
+inline auto decode_header(const uint8_t in[HEADER_SIZE]) noexcept -> EntryHeader {
     return {
         .flags   = in[0],
         .key_len = in[1],
@@ -159,9 +159,9 @@ public:
     ~MappedFile() { close(); }
 
     MappedFile(const MappedFile&)            = delete;
-    MappedFile& operator=(const MappedFile&) = delete;
+    auto operator=(const MappedFile&) -> MappedFile& = delete;
 
-    bool open(std::string_view path) {
+    auto open(std::string_view path) -> bool {
         path_ = path;
 #ifdef _WIN32
         file_ = CreateFileA(path_.c_str(),
@@ -195,7 +195,7 @@ public:
 #endif
     }
 
-    bool remap() {
+    auto remap() -> bool {
         unmap();
         size_ = file_size();
         if (size_ == 0) {
@@ -227,7 +227,7 @@ public:
         return true;
     }
 
-    bool append(const void* data, size_t len) {
+    auto append(const void* data, size_t len) -> bool {
         if (len == 0) {
             return true;
         }
@@ -249,7 +249,7 @@ public:
 #endif
     }
 
-    bool rewrite(const std::vector<uint8_t>& data) {
+    auto rewrite(const std::vector<uint8_t>& data) -> bool {
         unmap();
 #ifdef _WIN32
         SetFilePointer(file_, 0, nullptr, FILE_BEGIN);
@@ -271,8 +271,8 @@ public:
         return remap();
     }
 
-    const uint8_t* ptr()  const noexcept { return ptr_;  }
-    size_t         size() const noexcept { return size_; }
+    [[nodiscard]] auto ptr()  const noexcept -> const uint8_t* { return ptr_;  }
+    [[nodiscard]] auto         size() const noexcept -> size_t { return size_; }
 
 private:
     void unmap() {
@@ -287,7 +287,7 @@ private:
         size_ = 0;
     }
 
-    size_t file_size() const noexcept {
+    [[nodiscard]] auto file_size() const noexcept -> size_t {
 #ifdef _WIN32
         LARGE_INTEGER sz{};
         GetFileSizeEx(file_, &sz);
@@ -337,9 +337,9 @@ public:
      * @param value The string value to store.
      */
     void put(std::string_view key, std::string_view value) {
-        ops_.push_back({ std::string(key),
-                         std::vector<uint8_t>(value.begin(), value.end()),
-                         false });
+        ops_.push_back({ .key=std::string(key),
+                         .val=std::vector<uint8_t>(value.begin(), value.end()),
+                         .is_delete=false });
     }
 
      /**
@@ -365,9 +365,9 @@ public:
                && !std::is_convertible_v<T, std::string_view>)
     void put(std::string_view key, const T& value) {
         const auto* p = reinterpret_cast<const uint8_t*>(&value);
-        ops_.push_back({ std::string(key),
-                         std::vector<uint8_t>(p, p + sizeof(T)),
-                         false });
+        ops_.push_back({ .key=std::string(key),
+                         .val=std::vector<uint8_t>(p, p + sizeof(T)),
+                         .is_delete=false });
     }
 
     /**
@@ -379,7 +379,7 @@ public:
      * @param key The key to delete.
      */
     void remove(std::string_view key) {
-        ops_.push_back({ std::string(key), {}, true });
+        ops_.push_back({ .key=std::string(key), .val={}, .is_delete=true });
     }
 
 private:
@@ -448,7 +448,7 @@ public:
     /// @cond
     ~DB() = default;
     DB(const DB&)            = delete;
-    DB& operator=(const DB&) = delete;
+    auto operator=(const DB&) -> DB& = delete;
     /// @endcond
 
     // --- WRITE ---
@@ -464,7 +464,7 @@ public:
      * @param value String value to store.
      */
     void put(std::string_view key, std::string_view value) {
-        std::lock_guard lock(mu_);
+        std::scoped_lock lock(mu_);
         append_entry(
             key,
             reinterpret_cast<const uint8_t*>(value.data()),
@@ -496,7 +496,7 @@ public:
         requires (std::is_trivially_copyable_v<T>
                && !std::is_convertible_v<T, std::string_view>)
     void put(std::string_view key, const T& value) {
-        std::lock_guard lock(mu_);
+        std::scoped_lock lock(mu_);
         append_entry(
             key,
             reinterpret_cast<const uint8_t*>(&value),
@@ -535,8 +535,8 @@ public:
      * @endcode
      */
     template <typename T = std::string>
-    std::optional<T> get(std::string_view key) const {
-        std::lock_guard lock(mu_);
+    auto get(std::string_view key) const -> std::optional<T> {
+        std::scoped_lock lock(mu_);
         auto it = index_.find(std::string(key));
         if (it == index_.end()) {
             return std::nullopt;
@@ -570,7 +570,7 @@ public:
      * @param key The key to delete.
      */
     void remove(std::string_view key) {
-        std::lock_guard lock(mu_);
+        std::scoped_lock lock(mu_);
         if (!index_.contains(std::string(key))) {
             return;
         }
@@ -585,8 +585,8 @@ public:
      * @param key The key to look up.
      * @return `true` if the key exists, `false` otherwise.
      */
-    [[nodiscard]] bool has(std::string_view key) const {
-        std::lock_guard lock(mu_);
+    [[nodiscard]] auto has(std::string_view key) const -> bool {
+        std::scoped_lock lock(mu_);
         return index_.contains(std::string(key));
     }
 
@@ -615,8 +615,8 @@ public:
      *   });
      * @endcode
      */
-    void each(std::function<void(std::string_view, Bytes)> fn) {
-        std::lock_guard lock(mu_);
+    void each(const std::function<void(std::string_view, Bytes)>& fn) {
+        std::scoped_lock lock(mu_);
         for (const auto& [key, entry] : index_) {
             auto* ptr = reinterpret_cast<const std::byte*>(file_.ptr() + entry.val_offset);
             fn(key, Bytes{ ptr, entry.val_len });
@@ -653,8 +653,8 @@ public:
      *   });
      * @endcode
      */
-    void prefix(std::string_view pfx, std::function<void(std::string_view, Bytes)> fn) {
-        std::lock_guard lock(mu_);
+    void prefix(std::string_view pfx, const std::function<void(std::string_view, Bytes)>& fn) {
+        std::scoped_lock lock(mu_);
         for (const auto& [key, entry] : index_) {
             if (key.starts_with(pfx)) {
                 auto* ptr = reinterpret_cast<const std::byte*>(file_.ptr() + entry.val_offset);
@@ -700,12 +700,12 @@ public:
      *   });
      * @endcode
      */
-    void transaction(std::function<TxResult(Tx&)> fn) {
+    void transaction(const std::function<TxResult(Tx&)>& fn) {
         Tx tx;
         TxResult result = fn(tx);
         if (result == rollback) return;
 
-        std::lock_guard lock(mu_);
+        std::scoped_lock lock(mu_);
         for (const auto& op : tx.ops_) {
             append_entry(
                 op.key,
@@ -745,7 +745,7 @@ public:
      * @endcode
      */
     void compact() {
-        std::lock_guard lock(mu_);
+        std::scoped_lock lock(mu_);
 
         std::vector<uint8_t> buf;
         buf.reserve(file_.size());
@@ -775,7 +775,7 @@ public:
             const auto* val_ptr = file_.ptr() + entry.val_offset;
             buf.insert(buf.end(), val_ptr, val_ptr + entry.val_len);
 
-            new_index[key] = { val_off, entry.val_len };
+            new_index[key] = { .val_offset=val_off, .val_len=entry.val_len };
         }
 
         if (!file_.rewrite(buf)) {
@@ -792,8 +792,8 @@ public:
      *
      * @return Number of keys in the index.
      */
-    [[nodiscard]] size_t key_count() const {
-        std::lock_guard lock(mu_);
+    [[nodiscard]] auto key_count() const -> size_t {
+        std::scoped_lock lock(mu_);
         return index_.size();
     }
 
@@ -806,8 +806,8 @@ public:
      *
      * @return File size in bytes.
      */
-    [[nodiscard]] size_t file_size() const {
-        std::lock_guard lock(mu_);
+    [[nodiscard]] auto file_size() const -> size_t {
+        std::scoped_lock lock(mu_);
         return file_.size();
     }
 
@@ -856,7 +856,7 @@ private:
             if (hdr.flags == detail::FLAG_TOMB) {
                 index_.erase(key);
             } else {
-                index_[key] = { pos, hdr.val_len };
+                index_[key] = { .val_offset=pos, .val_len=hdr.val_len };
             }
 
             pos += hdr.val_len;
@@ -898,7 +898,7 @@ private:
             index_.erase(std::string(key));
         } else {
             size_t val_off = file_.size() - val_len;
-            index_[std::string(key)] = { val_off, val_len };
+            index_[std::string(key)] = { .val_offset=val_off, .val_len=val_len };
         }
     }
 
