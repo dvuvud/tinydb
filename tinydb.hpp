@@ -48,6 +48,8 @@
  * - Maximum value length: ~4 GB (uint32_t).
  * - No range queries (keys are stored in hash order).
  * - The full key set lives in RAM (std::unordered_map).
+ * - Windows-specific: The database file is locked while a DB object exists. 
+ *   You must destroy the DB object before attempting to delete or move the file.
  *
  * @par Compiler requirements
  * C++20. Tested with GCC 12+, Clang 15+, MSVC 19.34+.
@@ -463,8 +465,15 @@ public:
         }
     }
 
-    /// @cond
+    /**
+     * @brief Closes the database and releases all file locks.
+     * 
+     * @note On Windows, the underlying file is locked as long as this object 
+     * exists. Ensure this object is destroyed before calling 
+     * `std::filesystem::remove()` on the database file.
+     */
     ~DB() = default;
+    /// @cond
     DB(const DB&)            = delete;
     auto operator=(const DB&) -> DB& = delete;
     /// @endcond
