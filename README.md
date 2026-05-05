@@ -252,7 +252,7 @@ All public methods are thread-safe via a single `std::mutex`.
 ```bash
 cmake -B build
 cmake --build build
-./tests/tinydb-tests
+ctest --test-dir build --output-on-failure
 ```
 
 ---
