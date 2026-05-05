@@ -19,6 +19,11 @@
 #include <string>
 #include <string_view>
 
+#ifdef _WIN32
+  #define popen _popen
+  #define pclose _pclose
+#endif
+
 static constexpr std::string_view DB_PATH = ".cmdcache.db";
 
 static auto run_command(const std::string& cmd) -> std::string {
