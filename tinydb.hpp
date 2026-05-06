@@ -64,6 +64,8 @@
 #pragma once
 
 #include <cassert>
+#include <condition_variable>
+#include <shared_mutex>
 #include <stdexcept>
 #include <mutex>
 #include <cstddef>
@@ -248,9 +250,9 @@ public:
     auto remap() -> bool {
         unmap();
         size_ = file_size();
-        dirty_ = false;
         file_size_ = size_;
         if (size_ == 0) {
+            dirty_.store(false, std::memory_order_release);
             return true;
         }
 
@@ -258,6 +260,7 @@ public:
         map_ = CreateFileMappingA(file_, nullptr, PAGE_READWRITE, 0, 0, nullptr);
 
         if (!map_) {
+            dirty_.store(false, std::memory_order_release);
             return false;
         }
 
@@ -266,6 +269,7 @@ public:
         if (!ptr_) {
             CloseHandle(map_);
             map_ = nullptr;
+            dirty_.store(false, std::memory_order_release);
             return false;
         }
 #else
@@ -273,9 +277,11 @@ public:
 
         if (ptr_ == MAP_FAILED) {
             ptr_ = nullptr;
+            dirty_.store(false, std::memory_order_release);
             return false;
         }
 #endif
+        dirty_.store(false, std::memory_order_release);
         return true;
     }
 
@@ -296,7 +302,7 @@ public:
             return false;
         }
 #endif
-        dirty_ = true;
+        dirty_.store(true, std::memory_order_relaxed);
         file_size_ += len;
         return true;
     }
@@ -324,19 +330,22 @@ public:
         if (::ftruncate(fd_, 0) < 0) return false;
         ::lseek(fd_, 0, SEEK_SET);
         if (::write(fd_, data.data(), data.size())
-            != static_cast<ssize_t>(data.size()))
+            != static_cast<ssize_t>(data.size())) {
             return false;
+        }
         ::fsync(fd_);
 #endif
         return remap();
     }
 
     [[nodiscard]] auto ptr() const noexcept -> const uint8_t* {
-        if (dirty_) {
-            const_cast<MappedFile*>(this)->remap();
-        }
         return ptr_;
     }
+
+    [[nodiscard]] auto is_dirty() const noexcept -> bool {
+        return dirty_.load(std::memory_order_acquire);;
+    }
+
     [[nodiscard]] auto size() const noexcept -> size_t { return file_size_; }
 
 private:
@@ -372,8 +381,8 @@ private:
 #endif
     uint8_t* ptr_  = nullptr;
     size_t size_ = 0;
-    bool dirty_ = false;
     size_t file_size_ = 0;
+    std::atomic<bool> dirty_{false};
     std::string path_;
 };
 }   // namespace detail
@@ -610,7 +619,9 @@ public:
      */
     template <typename T = std::string>
     auto get(std::string_view key) const -> std::optional<T> {
-        std::scoped_lock lock(mu_);
+        std::shared_lock lock(mu_);
+        ensure_mapped();
+
         auto it = index_.find(std::string(key));
         if (it == index_.end()) {
             return std::nullopt;
@@ -660,7 +671,8 @@ public:
      * @return `true` if the key exists, `false` otherwise.
      */
     [[nodiscard]] auto has(std::string_view key) const -> bool {
-        std::scoped_lock lock(mu_);
+        std::shared_lock lock(mu_);
+        ensure_mapped();
         return index_.contains(std::string(key));
     }
 
@@ -689,8 +701,9 @@ public:
      *   });
      * @endcode
      */
-    void each(const std::function<void(std::string_view, Bytes)>& fn) {
-        std::scoped_lock lock(mu_);
+    void each(const std::function<void(std::string_view, Bytes)>& fn) const {
+        std::shared_lock lock(mu_);
+        ensure_mapped();
         for (const auto& [key, entry] : index_) {
             auto* ptr = reinterpret_cast<const std::byte*>(file_.ptr() + entry.val_offset);
             fn(key, Bytes{ ptr, entry.val_len });
@@ -727,8 +740,9 @@ public:
      *   });
      * @endcode
      */
-    void prefix(std::string_view pfx, const std::function<void(std::string_view, Bytes)>& fn) {
-        std::scoped_lock lock(mu_);
+    void prefix(std::string_view pfx, const std::function<void(std::string_view, Bytes)>& fn) const {
+        std::shared_lock lock(mu_);
+        ensure_mapped();
         for (const auto& [key, entry] : index_) {
             if (key.starts_with(pfx)) {
                 auto* ptr = reinterpret_cast<const std::byte*>(file_.ptr() + entry.val_offset);
@@ -832,6 +846,10 @@ public:
     void compact() {
         std::scoped_lock lock(mu_);
 
+        if (file_.is_dirty()) {
+            file_.remap();
+        }
+
         std::vector<uint8_t> buf;
         buf.reserve(file_.size());
 
@@ -878,7 +896,7 @@ public:
      * @return Number of keys in the index.
      */
     [[nodiscard]] auto key_count() const -> size_t {
-        std::scoped_lock lock(mu_);
+        std::shared_lock lock(mu_);
         return index_.size();
     }
 
@@ -892,7 +910,7 @@ public:
      * @return File size in bytes.
      */
     [[nodiscard]] auto file_size() const -> size_t {
-        std::scoped_lock lock(mu_);
+        std::shared_lock lock(mu_);
         return file_.size();
     }
 
@@ -985,9 +1003,22 @@ private:
         }
     }
 
-    detail::MappedFile file_;
+    void ensure_mapped() const {
+        if (!file_.is_dirty()) {
+            return;
+        }
+
+        std::unique_lock sync_lock(sync_mutex_);
+        if (file_.is_dirty()) {
+            file_.remap();
+        }
+    }
+
     std::unordered_map<std::string, detail::IndexEntry> index_;
-    mutable std::mutex mu_;
+    mutable detail::MappedFile file_;
+    mutable detail::WritePreferringRWLock mu_;
+    mutable std::mutex sync_mutex_;
+
 };
 
 }   // namespace tinydb
