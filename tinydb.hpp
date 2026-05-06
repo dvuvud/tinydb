@@ -41,8 +41,19 @@
  * @endcode
  *
  * @par Thread safety
- * All public methods are thread-safe. A single std::mutex serialises
- * concurrent access.
+ * All public methods are thread-safe. Concurrent reads are permitted via a
+ * write-preferring reader-writer lock: multiple threads may call @p get(),
+ * @p has(), @p each(), @p prefix(), @p key_count(), and @p file_size()
+ * simultaneously. Write operations (@p put(), @p remove(), @p transaction(),
+ * @p compact()) acquire an exclusive lock and block until all active readers
+ * have finished. Waiting writers take priority over new readers to prevent
+ * writer starvation.
+ *
+ * The memory-mapped file is remapped lazily: writes leave the mapping stale
+ * and the first reader to observe a dirty mapping performs the remap under a
+ * secondary @p sync_mutex_ before proceeding. Subsequent concurrent readers
+ * that also observed the dirty flag wait for the remap to complete and then
+ * proceed without remapping again.
  *
  * @par Important limitations
  * - Maximum key length: 255 bytes.
@@ -56,7 +67,7 @@
  * C++20. Tested with GCC 12+, Clang 15+, MSVC 19.34+.
  * Runs on Linux, macOS, and Windows.
  *
- * @version 1.1.0
+ * @version 1.2.0
  * @par License
  * MIT License
  */
@@ -158,7 +169,22 @@ struct IndexEntry {
     uint32_t val_len;
 };
 
-/* A write-preferring reader-writer lock */
+/**
+ * @brief A write-preferring reader-writer lock.
+ *
+ * Satisfies BasicLockable (lock/unlock) and SharedLockable (lock_shared/
+ * unlock_shared), so it works directly with std::unique_lock,
+ * std::scoped_lock, and std::shared_lock via class template argument
+ * deduction. There is no explicit template parameter required.
+ *
+ * Write priority is enforced via @p waiting_writers_: once any writer
+ * calls @p lock(), new readers block in @p lock_shared() until all
+ * pending writers have finished, preventing writer starvation.
+ *
+ * An internal @p std::mutex guards the counter members themselves.
+ * Condition variables are used for sleeping rather than spinning, so
+ * blocked threads do not consume CPU while waiting.
+ */
 class WritePreferringRWLock {
 public:
     void lock() {
@@ -338,10 +364,20 @@ public:
         return remap();
     }
 
+    /** 
+     * Returns a pointer into the mapped region.
+     * The caller must ensure the mapping is fresh by calling ensure_mapped()
+     * (via DB) before dereferencing.
+     */
     [[nodiscard]] auto ptr() const noexcept -> const uint8_t* {
         return ptr_;
     }
 
+    /**
+     * Returns true if the file has been written to since the last remap().
+     * Safe to call from any thread holding at least a shared lock on mu_,
+     * since only exclusive-lock holders can set this flag.
+     */
     [[nodiscard]] auto is_dirty() const noexcept -> bool {
         return dirty_.load(std::memory_order_acquire);;
     }
@@ -477,8 +513,10 @@ private:
  * Keys are UTF-8 strings up to 255 bytes. Values can be std::string,
  * string literals, or any trivially copyable type (int, float, struct, ...).
  *
- * The database is safe to use from multiple threads concurrently since all public
- * methods acquire an internal mutex.
+ * The database is safe to use from multiple threads concurrently. Reads
+ * proceed in parallel, and writes acquire an exclusive lock and are given
+ * priority over waiting readers to prevent starvation. See the
+ * @ref index "Thread safety" section in the main page for full details.
  *
  * @note @p DB is non-copyable. Create one instance per file.
  *
@@ -543,6 +581,9 @@ public:
      * appended to the on-disk log immediately but is not explicitly fsynced.
      * Use transaction() if you require durability guarantees.
      *
+     * Acquires an exclusive lock, blocking until all active readers have
+     * finished. Waiting writers take priority over new readers.
+     *
      * @param key   Key to write. Must be between 1 and 255 bytes.
      * @param value String value to store.
      */
@@ -562,6 +603,9 @@ public:
      * The value is stored as its raw bytes via `memcpy`. Overwriting a key
      * with a value of a different size is valid. A subsequent get<T>() call
      * will return `nullopt` if the stored size does not match `sizeof(T)`.
+     *
+     * Acquires an exclusive lock, blocking until all active readers have
+     * finished. Waiting writers take priority over new readers.
      *
      * @tparam T    Any trivially copyable type: int, float, bool, struct, etc.
      *              Must not be implicitly convertible to std::string_view.
@@ -599,6 +643,10 @@ public:
      *
      * The default template parameter is `std::string`, so `db.get("key")` and
      * `db.get<std::string>("key")` are equivalent.
+     *
+     * Acquires a shared lock, allowing concurrent calls from other readers.
+     * If the memory-mapped file is stale from a recent write, this thread
+     * will remap it before reading (see @p ensure_mapped()).
      *
      * @tparam T The type to deserialise into. Defaults to `std::string`.
      *           Must be `std::string` or a trivially copyable type.
@@ -652,6 +700,9 @@ public:
      * If the key does not exist this is a no-op. Space used by the old value
      * is reclaimed the next time compact() is called.
      *
+     * Acquires an exclusive lock, blocking until all active readers have
+     * finished. Waiting writers take priority over new readers.
+     *
      * @param key The key to delete.
      */
     void remove(std::string_view key) {
@@ -666,6 +717,8 @@ public:
 
     /**
      * @brief Returns true if the given key exists in the database.
+     *
+     * Acquires a shared lock, allowing concurrent calls from other readers.
      *
      * @param key The key to look up.
      * @return `true` if the key exists, `false` otherwise.
@@ -683,12 +736,19 @@ public:
      * and a `Bytes` span pointing directly into the memory-mapped file.
      * The iteration order is unspecified.
      *
+     * Acquires a shared lock for the duration of iteration, allowing
+     * concurrent readers. Write methods called from another thread will
+     * block until iteration completes.
+     *
      * @param fn Callback of the form `void(std::string_view key, Bytes val)`.
      *
-     * @warning The database mutex is held for the entire duration of
-     *          iteration. Do not call any DB method from inside @p fn,
-     *          as it will deadlock. If you need to modify the database during
-     *          iteration, copy the keys out first and operate on them after.
+     * @warning Do not call any write method (@p put, @p remove, @p transaction,
+     * @p compact) on this DB instance from inside @p fn. The shared
+     * lock is not reentrant with an exclusive lock and will deadlock.
+     * Read methods (@p get, @p has, @p key_count etc.) are safe to
+     * call from inside @p fn.
+     * If you need to write during iteration, copy the keys out first
+     * and operate on them after @p each() returns.
      *
      * @warning The `Bytes` span is only valid for the duration of the
      *          callback. Do not store it. Instead, copy the data if you need it later.
@@ -717,17 +777,14 @@ public:
      * keys stored as `"user:1001"`, `"user:1002"`, etc. can be iterated with
      * `db.prefix("user:", fn)`.
      *
-     * The callback and iteration order behave identically to each().
+     * The callback and locking behaviour are identical to each(). The same
+     * warnings about write methods and Bytes span lifetime apply.
      *
      * @param pfx The prefix string to filter by.
      * @param fn  Callback of the form `void(std::string_view key, Bytes val)`.
      *
      * @note Iteration is O(total keys), not O(matching keys), because the
      *       underlying index is a hash map with no sorted order.
-     *
-     * @warning The database mutex is held for the entire duration of
-     *          iteration. Do not call any DB method from inside @p fn,
-     *          as it will deadlock.
      *
      * @par Example
      * @code
@@ -820,9 +877,9 @@ public:
      * overwritten or deleted. `compact()` rewrites the file with only the
      * current live values, reclaiming that space.
      *
-     * Blocks all reads and writes for the duration of the rewrite. The
-     * database remains fully consistent. If the process is interrupted
-     * mid-compact the old file is still intact.
+     * Acquires an exclusive lock, blocking all reads and writes for the
+     * duration of the rewrite. The database remains fully consistent. If
+     * the process is interrupted mid-compact the old file is still intact.
      *
      * There is no automatic compaction. Call this periodically if your
      * workload involves many overwrites or deletions.
@@ -893,6 +950,8 @@ public:
     /**
      * @brief Returns the number of live keys currently stored.
      *
+     * Acquires a shared lock, allowing concurrent calls from other readers.
+     *
      * @return Number of keys in the index.
      */
     [[nodiscard]] auto key_count() const -> size_t {
@@ -906,6 +965,8 @@ public:
      * This includes space used by dead entries (overwritten or deleted values)
      * that have not yet been reclaimed by compact(). It is an upper bound on
      * the live data size.
+     *
+     * Acquires a shared lock, allowing concurrent calls from other readers.
      *
      * @return File size in bytes.
      */
@@ -1003,6 +1064,24 @@ private:
         }
     }
 
+    /**
+     * @brief Ensures the memory-mapped file reflects the latest on-disk data.
+     *
+     * Must be called at the top of every read method, after acquiring a
+     * shared lock on @p mu_.
+     *
+     * Fast path: if the mapping is not dirty, returns immediately with no
+     * locking overhead.
+     *
+     * Slow path: acquires @p sync_mutex_ so that exactly one reader among
+     * all concurrent readers performs the remap. The rest block on
+     * @p sync_mutex_ and skip the remap when they acquire it, since the
+     * first thread will have already cleared the dirty flag.
+     *
+     * This is safe to call under a shared lock because @p dirty_ is only
+     * ever set by writers, who hold an exclusive lock, and no writer
+     * can be active while any reader holds a shared lock.
+     */
     void ensure_mapped() const {
         if (!file_.is_dirty()) {
             return;
