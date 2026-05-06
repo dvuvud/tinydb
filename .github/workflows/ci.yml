@@ -3,9 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
-    paths: ['tinydb.hpp', 'tests/test.cpp', '.github/workflows/ci.yml']
+    paths: ['tinydb.hpp', 'tests/*', '.github/workflows/ci.yml']
   pull_request:
-    paths: ['tinydb.hpp', 'tests/test.cpp', '.github/workflows/ci.yml']
+    paths: ['tinydb.hpp', 'tests/*', '.github/workflows/ci.yml']
 
 jobs:
   lint:
