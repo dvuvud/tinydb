@@ -46,6 +46,8 @@ if(TINYDB_BUILD_BENCHMARKS)
     add_subdirectory(external/googlebenchmark)
     find_package(SQLite3 REQUIRED)
     add_executable(tinydb_benchmarks benchmarks/bench.cpp)
+    add_executable(tinydb_concurrency_benchmarks benchmarks/bench_concurrent.cpp)
     target_link_libraries(tinydb_benchmarks PRIVATE benchmark::benchmark_main SQLite::SQLite3)
+    target_link_libraries(tinydb_concurrency_benchmarks PRIVATE benchmark::benchmark_main SQLite::SQLite3)
 endif()
 
