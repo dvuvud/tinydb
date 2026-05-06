@@ -29,7 +29,7 @@
  *
  * @par File & data layout
  * @code
- *   [magic: 8 bytes "fluxen01"]
+ *   [magic: 8 bytes "FLUXEN01"]
  *   [entry] [entry] ...
  *
  *   entry layout:
@@ -127,7 +127,7 @@ enum TxResult : uint8_t { commit, rollback };
 /// @cond INTERNAL
 namespace detail {
 
-inline constexpr uint8_t MAGIC[8]  = { 'T','I','N','Y','D','B','0','1' };
+inline constexpr uint8_t MAGIC[8]  = { 'F','L','U','X','E','N','0','1' };
 inline constexpr uint8_t FLAG_LIVE = 0x00;
 inline constexpr uint8_t FLAG_TOMB = 0x01;
 inline constexpr uint8_t MAX_KEY   = 255;
