@@ -156,6 +156,52 @@ struct IndexEntry {
     uint32_t val_len;
 };
 
+/* A write-preferring reader-writer lock */
+class WritePreferringRWLock {
+public:
+    void lock() {
+        std::unique_lock lk(mu_);
+        ++waiting_writers_;
+        write_cv_.wait(lk, [this] () -> bool{
+            return active_readers_ == 0 && active_writers_ == 0;
+        });
+        --waiting_writers_;
+        ++active_writers_;
+    }
+
+    void unlock() {
+        std::unique_lock lk(mu_);
+        --active_writers_;
+        if (waiting_writers_ > 0) {
+            write_cv_.notify_one();
+        } else {
+            read_cv_.notify_all();
+        }
+    }
+
+    void lock_shared() {
+        std::unique_lock lk(mu_);
+        read_cv_.wait(lk, [this] () -> bool{
+            return waiting_writers_ == 0 && active_writers_ == 0;
+        });
+        ++active_readers_;
+    }
+
+    void unlock_shared() {
+        std::unique_lock lk(mu_);
+        if (--active_readers_ == 0 && waiting_writers_ > 0) {
+            write_cv_.notify_one();
+        }
+    }
+private:
+    std::mutex mu_;
+    std::condition_variable read_cv_;
+    std::condition_variable write_cv_;
+    int active_readers_  = 0;
+    int active_writers_  = 0;
+    int waiting_writers_ = 0;
+};
+
 /* Cross-platform mmap wrapper */
 class MappedFile {
 public:
