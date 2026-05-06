@@ -54,6 +54,14 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Cache Build
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: ${{ runner.os }}-${{ matrix.cc }}-${{ hashFiles('**/CMakeLists.txt', 'external/**') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.cc }}-
+
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
