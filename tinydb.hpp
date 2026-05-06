@@ -279,25 +279,112 @@ public:
 #endif
     }
 
+    /**
+     * Atomically replaces the database file with @p data by writing to a
+     * temporary file (@p path_ + ".tmp"), fsyncing it, then renaming it over
+     * the original. On POSIX the rename is atomic. A crash at any point
+     * leaves either the old file or the new file fully intact. On Windows
+     * ReplaceFileA is used.
+     *
+     * The existing mapping and file handle are closed before the rename and
+     * a fresh handle + mapping are opened afterwards.
+     */
     auto rewrite(const std::vector<uint8_t>& data) -> bool {
+        const std::string tmp_path = path_ + ".tmp";
+
+#ifdef _WIN32
+        HANDLE tmp = CreateFileA(
+            tmp_path.c_str(),
+            GENERIC_WRITE, 0, nullptr,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr
+        );
+        if (tmp == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+        DWORD written = 0;
+        const bool write_ok =
+            WriteFile(tmp, data.data(), static_cast<DWORD>(data.size()), &written, nullptr)
+            && written == static_cast<DWORD>(data.size());
+        FlushFileBuffers(tmp);
+        CloseHandle(tmp);
+ 
+        if (!write_ok) {
+            DeleteFileA(tmp_path.c_str());
+            return false;
+        }
+#else
+        const int tmp_fd = ::open(tmp_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (tmp_fd < 0) {
+            return false;
+        }
+        const bool write_ok =
+            ::write(tmp_fd, data.data(), data.size()) == static_cast<ssize_t>(data.size());
+        ::fsync(tmp_fd);
+        ::close(tmp_fd);
+ 
+        if (!write_ok) {
+            ::unlink(tmp_path.c_str());
+            return false;
+        }
+#endif
         unmap();
 #ifdef _WIN32
-        SetFilePointer(file_, 0, nullptr, FILE_BEGIN);
-        SetEndOfFile(file_);
-        DWORD written = 0;
-        if (!WriteFile(file_, data.data(), static_cast<DWORD>(data.size()),
-                       &written, nullptr)) {
-            return false;
+        if (file_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(file_);
+            file_ = INVALID_HANDLE_VALUE;
         }
-        FlushFileBuffers(file_);
 #else
-        if (::ftruncate(fd_, 0) < 0) return false;
-        ::lseek(fd_, 0, SEEK_SET);
-        if (::write(fd_, data.data(), data.size())
-            != static_cast<ssize_t>(data.size())) {
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+#endif
+ 
+#ifdef _WIN32
+        if (!ReplaceFileA(path_.c_str(), tmp_path.c_str(), nullptr,
+                          REPLACEFILE_IGNORE_MERGE_ERRORS, nullptr, nullptr)) {
+            const DWORD err = GetLastError();
+
+            if (err != ERROR_UNABLE_TO_MOVE_REPLACEMENT) {
+                DeleteFileA(tmp_path.c_str());
+            }
+
+            file_ = CreateFileA(
+                err == ERROR_UNABLE_TO_MOVE_REPLACEMENT
+                ? tmp_path.c_str()
+                : path_.c_str(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ, nullptr,
+                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr
+            );
+
+            remap();
             return false;
         }
-        ::fsync(fd_);
+#else
+        if (::rename(tmp_path.c_str(), path_.c_str()) != 0) {
+            ::unlink(tmp_path.c_str());
+            fd_ = ::open(path_.c_str(), O_RDWR, 0644);
+            remap();
+            return false;
+        }
+#endif
+ 
+#ifdef _WIN32
+        file_ = CreateFileA(
+            path_.c_str(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr
+        );
+        if (file_ == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+#else
+        fd_ = ::open(path_.c_str(), O_RDWR, 0644);
+        if (fd_ < 0) {
+            return false;
+        }
 #endif
         return remap();
     }
@@ -814,6 +901,11 @@ public:
      * The append-only log accumulates dead entries over time as keys are
      * overwritten or deleted. `compact()` rewrites the file with only the
      * current live values, reclaiming that space.
+     *
+     * The rewrite is crash-safe. Compacted data is first written to a
+     * temporary file (@p <path>.tmp), fsynced, and then atomically renamed
+     * over the original. A crash at any point leaves either the original
+     * or the fully written new file intact. That way data is never lost.
      *
      * Acquires an exclusive lock, blocking all reads and writes for the
      * duration of the rewrite. The database remains fully consistent. If
