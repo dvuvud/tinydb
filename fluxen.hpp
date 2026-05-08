@@ -168,6 +168,18 @@ struct IndexEntry {
     uint32_t val_len;
 };
 
+struct StringHash {
+    using is_transparent = void;
+
+    auto operator()(std::string_view sv) const noexcept -> size_t {
+        return std::hash<std::string_view>{}(sv);
+    }
+    auto operator()(const std::string& s) const noexcept -> size_t {
+        return std::hash<std::string_view>{}(s);
+    }
+};
+
+
 /* Cross-platform mmap wrapper */
 class MappedFile {
 public:
@@ -695,7 +707,7 @@ public:
         std::shared_lock lock(mu_);
         ensure_mapped();
 
-        auto it = index_.find(std::string(key));
+        auto it = index_.find(key);
         if (it == index_.end()) {
             return std::nullopt;
         }
@@ -732,9 +744,6 @@ public:
      */
     void remove(std::string_view key) {
         std::unique_lock lock(mu_);
-        if (!index_.contains(std::string(key))) {
-            return;
-        }
         append_entry(key, nullptr, 0, true);
     }
 
@@ -751,7 +760,7 @@ public:
     [[nodiscard]] auto has(std::string_view key) const -> bool {
         std::shared_lock lock(mu_);
         ensure_mapped();
-        return index_.contains(std::string(key));
+        return index_.contains(key);
     }
 
     /**
@@ -946,7 +955,7 @@ public:
             detail::MAGIC + sizeof(detail::MAGIC)
         );
 
-        std::unordered_map<std::string, detail::IndexEntry> new_index;
+        std::unordered_map<std::string, detail::IndexEntry, detail::StringHash, std::equal_to<>> new_index;
         for (const auto& [key, entry] : index_) {
             detail::EntryHeader hdr{
                 .flags   = detail::FLAG_LIVE,
@@ -1088,7 +1097,9 @@ private:
         file_.append(buf.data(), buf.size());
 
         if (tombstone) {
-            index_.erase(std::string(key));
+            if (auto it = index_.find(key); it != index_.end()) {
+                index_.erase(it);
+            }
         } else {
             index_[std::string(key)] = { .val_offset=file_.size() - val_len, .val_len=val_len };
         }
@@ -1123,7 +1134,7 @@ private:
         }
     }
 
-    std::unordered_map<std::string, detail::IndexEntry> index_;
+    std::unordered_map<std::string, detail::IndexEntry, detail::StringHash, std::equal_to<>> index_;
     mutable detail::MappedFile file_;
     mutable std::shared_mutex mu_;
     mutable std::mutex sync_mutex_;
