@@ -1060,7 +1060,11 @@ public:
 
 private:
   /// Writes the magic header to a newly created file.
-  void init_file() { file_.append(detail::MAGIC, sizeof(detail::MAGIC)); }
+  void init_file() {
+    if (!file_.append(detail::MAGIC, sizeof(detail::MAGIC))) {
+      throw std::runtime_error("fluxen: failed to write magic header");
+    }
+  }
 
   /**
    * @brief Scans the on-disk log to rebuild the in-memory index.
