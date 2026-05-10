@@ -13,6 +13,17 @@ ctest --test-dir build --output-on-failure
 
 All library code is in `fluxen.hpp`. Tests are in `tests/test.cpp`. Examples are in `examples/`.
 
+## Running benchmarks
+Benchmarks must be run in a **Release build**.
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release
+./build/fluxen_benchmarks
+./build/fluxen_concurrency_benchmarks
+```
+
+Note that benchmarks depend on SQLite3, which must be installed on your system.
+
 ## Guidelines
 
 - Open an issue before starting on anything large
