@@ -600,6 +600,14 @@ private:
   mutable detail::MappedFile file_;
   mutable std::shared_mutex mu_;
   mutable std::mutex sync_mutex_;
+  bool poisoned_ = false;
+
+  void check_poisoned() const {
+    if (poisoned_) {
+      throw std::runtime_error(
+          "fluxen: database is poisoned due to an unrecoverable I/O error");
+    }
+  }
 
 public:
   /**
@@ -657,6 +665,7 @@ public:
    * @param value String value to store.
    */
   void put(std::string_view key, std::string_view value) {
+    check_poisoned();
     std::unique_lock lock(mu_);
     append_entry(key, reinterpret_cast<const uint8_t *>(value.data()),
                  static_cast<uint32_t>(value.size()), false);
@@ -688,6 +697,7 @@ public:
     requires(std::is_trivially_copyable_v<T> &&
              !std::is_convertible_v<T, std::string_view>)
   void put(std::string_view key, const T &value) {
+    check_poisoned();
     std::unique_lock lock(mu_);
     append_entry(key, reinterpret_cast<const uint8_t *>(&value),
                  static_cast<uint32_t>(sizeof(T)), false);
@@ -728,6 +738,7 @@ public:
    */
   template <typename T = std::string>
   auto get(std::string_view key) const -> std::optional<T> {
+    check_poisoned();
     std::shared_lock lock(mu_);
     ensure_mapped();
 
@@ -768,6 +779,7 @@ public:
    * @param key The key to delete.
    */
   void remove(std::string_view key) {
+    check_poisoned();
     std::unique_lock lock(mu_);
     append_entry(key, nullptr, 0, true);
   }
@@ -783,6 +795,7 @@ public:
    * @return `true` if the key exists, `false` otherwise.
    */
   [[nodiscard]] auto has(std::string_view key) const -> bool {
+    check_poisoned();
     std::shared_lock lock(mu_);
     ensure_mapped();
     return index_.contains(key);
@@ -815,6 +828,7 @@ public:
    * @endcode
    */
   void each(const std::function<void(std::string_view, Bytes)> &fn) const {
+    check_poisoned();
     std::shared_lock lock(mu_);
     ensure_mapped();
     for (const auto &[key, entry] : index_) {
@@ -853,6 +867,7 @@ public:
    */
   void prefix(std::string_view pfx,
               const std::function<void(std::string_view, Bytes)> &fn) const {
+    check_poisoned();
     std::shared_lock lock(mu_);
     ensure_mapped();
     for (const auto &[key, entry] : index_) {
@@ -909,6 +924,7 @@ public:
    * @endcode
    */
   void transaction(const std::function<TxResult(Tx &)> &fn) {
+    check_poisoned();
     Tx tx;
     TxResult result = fn(tx);
     if (result == rollback) {
@@ -942,6 +958,7 @@ public:
 
     if (!file_.sync()) {
       if (!file_.truncate(size_before)) {
+        poisoned_ = true;
         throw std::runtime_error(
             "fluxen: transaction fsync failed and truncation failed. Database file may contain a partial tail entry");
       }
@@ -988,6 +1005,7 @@ public:
    * the mapped region. Reacquire any needed data after compaction.
    */
   void compact() {
+    check_poisoned();
     std::unique_lock lock(mu_);
 
     if (file_.is_dirty()) {
@@ -1038,6 +1056,7 @@ public:
    * @return Number of keys in the index.
    */
   [[nodiscard]] auto key_count() const -> size_t {
+    check_poisoned();
     std::shared_lock lock(mu_);
     return index_.size();
   }
@@ -1054,6 +1073,7 @@ public:
    * @return File size in bytes.
    */
   [[nodiscard]] auto file_size() const -> size_t {
+    check_poisoned();
     std::shared_lock lock(mu_);
     return file_.size();
   }
@@ -1147,7 +1167,16 @@ private:
       std::memcpy(buf.data() + detail::HEADER_SIZE + key.size(), val, val_len);
     }
 
-    file_.append(buf.data(), buf.size());
+    const size_t size_before = file_.size();
+
+    if (!file_.append(buf.data(), buf.size())) {
+      if (!file_.truncate(size_before)) {
+        poisoned_ = true;
+        throw std::runtime_error(
+            "fluxen: append failed and truncation failed. Database file may contain a partial tail entry");
+      }
+      throw std::runtime_error("fluxen: append failed");
+    }
 
     if (tombstone) {
       if (auto it = index_.find(key); it != index_.end()) {
