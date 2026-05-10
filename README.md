@@ -68,15 +68,9 @@ fluxen is **not** a good fit when:
 
 ## How it works
 
-fluxen uses a [Bitcask](https://riak.com/assets/bitcask-intro.pdf)-style design:
+fluxen uses a [Bitcask](https://riak.com/assets/bitcask-intro.pdf)-style design. The database is an append-only log backed by a memory-mapped file, with an in-memory hash index that maps each key to its byte offset. Reads look up that offset and return the value directly from the mapped region. Writes append a header, key, and value to the end of the file.
 
-- The database is an **append-only log** on disk backed by a memory-mapped file.
-- An **in-memory hash index** maps each key to the byte offset of its value in the file.
-- **Reads** look up the offset in the hash map and read directly from the mapped region.
-- **Writes** append a small header + key + value to the end of the file.
-- **Transactions** stage any number of operations and flush them in a single write + fsync.
-- **Deletes** append a tombstone. Dead space is reclaimed by `compact()`.
-- On open, the log is scanned once to rebuild the index (last write wins).
+Transactions stage any number of operations and flush them in a single write + fsync. Deletes append a tombstone, and dead space is reclaimed by `compact()`. On open, the log is scanned once to rebuild the index (last write wins).
 
 ---
 
