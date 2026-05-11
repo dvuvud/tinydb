@@ -1098,8 +1098,9 @@ public:
    *         could not be reopened. The DB object must be destroyed; any
    *         further use is undefined.
    *
-   * @warning Invalidates all previously returned Bytes spans and pointers into
-   * the mapped region. Reacquire any needed data after compaction.
+   * @warning On success, invalidates all previously returned Bytes spans and
+   * pointers into the mapped region. Reacquire any needed data after a
+   * successful compaction. Spans remain valid if false is returned.
    */
   [[nodiscard]] auto compact() -> bool {
     check_poisoned();
