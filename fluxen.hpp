@@ -368,7 +368,11 @@ public:
    *         an unusable state and the caller must not continue using it.
    * @throws std::runtime_error If the rename/replace failed and the
    *         subsequent remap of the original file failed. The MappedFile is
-   *         left in an unusable state and the caller must not continue using it.
+   *         left in an unusable state and the caller must not continue using
+   *         it.
+   * @throws std::runtime_error If the rename/replace succeeded but the
+   *         subsequent remap failed. The MappedFile is left in an unusable
+   *         state and the caller must not continue using it.
    */
   auto rewrite(const std::vector<uint8_t> &data) -> bool {
     const std::string tmp_path = path_ + ".tmp";
@@ -474,7 +478,10 @@ public:
           "fluxen: failed to reopen database file after successful rename");
     }
 #endif
-    return remap();
+    if (!remap()) {
+      throw std::runtime_error("fluxen: remap failed after successful rename");
+    }
+    return true;
   }
 
   /**
