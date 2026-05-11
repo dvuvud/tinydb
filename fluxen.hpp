@@ -358,6 +358,14 @@ public:
    *
    * The existing mapping and file handle are closed before the rename and
    * a fresh handle + mapping are opened afterwards.
+   *
+   * @param data The full file contents to write.
+   * @return true on success. false if the rename/replace failed. In that
+   *         case the original file is intact and the mapping has been
+   *         restored to it.
+   * @throws std::runtime_error If the rename/replace failed and the original
+   *         file could not be reopened afterwards. The MappedFile is left in
+   *         an unusable state and the caller must not continue using it.
    */
   auto rewrite(const std::vector<uint8_t> &data) -> bool {
     const std::string tmp_path = path_ + ".tmp";
@@ -412,17 +420,18 @@ public:
 #ifdef _WIN32
     if (!ReplaceFileA(path_.c_str(), tmp_path.c_str(), nullptr,
                       REPLACEFILE_IGNORE_MERGE_ERRORS, nullptr, nullptr)) {
-      const DWORD err = GetLastError();
 
-      if (err != ERROR_UNABLE_TO_MOVE_REPLACEMENT) {
-        DeleteFileA(tmp_path.c_str());
+      DeleteFileA(tmp_path.c_str());
+
+      file_ = CreateFileA(path_.c_str(), GENERIC_READ | GENERIC_WRITE,
+                          FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                          FILE_ATTRIBUTE_NORMAL, nullptr);
+
+      if (file_ == INVALID_HANDLE_VALUE) {
+        throw std::runtime_error(
+            "fluxen: failed to reopen database file after replace");
       }
 
-      file_ =
-          CreateFileA(err == ERROR_UNABLE_TO_MOVE_REPLACEMENT ? tmp_path.c_str()
-                                                              : path_.c_str(),
-                      GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr,
-                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
       SetFilePointer(file_, 0, nullptr, FILE_END);
       remap();
       return false;
@@ -431,6 +440,10 @@ public:
     if (::rename(tmp_path.c_str(), path_.c_str()) != 0) {
       ::unlink(tmp_path.c_str());
       fd_ = ::open(path_.c_str(), O_RDWR | O_APPEND, 0644);
+      if (fd_ < 0) {
+        throw std::runtime_error(
+            "fluxen: failed to reopen database file after rename");
+      }
       remap();
       return false;
     }
@@ -1021,7 +1034,8 @@ public:
       if (!file_.truncate(size_before)) {
         poisoned_ = true;
         throw std::runtime_error(
-            "fluxen: transaction fsync failed and truncation failed. Database file may contain a partial tail entry");
+            "fluxen: transaction fsync failed and truncation failed. Database "
+            "file may contain a partial tail entry");
       }
       throw std::runtime_error("fluxen: transaction fsync failed");
     }
@@ -1051,7 +1065,7 @@ public:
    * The rewrite is crash-safe. Compacted data is first written to a
    * temporary file (@p <path>.tmp), fsynced, and then atomically renamed
    * over the original. A crash at any point leaves either the original
-   * or the fully written new file intact. That way data is never lost.
+   * or the fully written new file intact.
    *
    * Acquires an exclusive lock, blocking all reads and writes for the
    * duration of the rewrite. The database remains fully consistent. If
@@ -1060,13 +1074,19 @@ public:
    * There is no automatic compaction. Call this periodically if your
    * workload involves many overwrites or deletions.
    *
+   * @return true if compaction succeeded. false if the atomic rename failed.
+   *         In that case the database is fully intact and usable, just not
+   *         compacted. The caller may retry later.
+   *
    * @throws std::runtime_error If the database is poisoned.
-   * @throws std::runtime_error If the file rewrite fails.
+   * @throws std::runtime_error If compaction failed and the original file
+   *         could not be reopened. The DB object must be destroyed; any
+   *         further use is undefined.
    *
    * @warning Invalidates all previously returned Bytes spans and pointers into
    * the mapped region. Reacquire any needed data after compaction.
    */
-  void compact() {
+  [[nodiscard]] auto compact() -> bool {
     check_poisoned();
     std::unique_lock lock(mu_);
 
@@ -1102,10 +1122,11 @@ public:
     }
 
     if (!file_.rewrite(buf)) {
-      throw std::runtime_error("fluxen: compact failed during rewrite");
+      return false;
     }
 
     index_ = std::move(new_index);
+    return true;
   }
 
   // --- DIAGNOSTICS ---
@@ -1237,7 +1258,8 @@ private:
       if (!file_.truncate(size_before)) {
         poisoned_ = true;
         throw std::runtime_error(
-            "fluxen: append failed and truncation failed. Database file may contain a partial tail entry");
+            "fluxen: append failed and truncation failed. Database file may "
+            "contain a partial tail entry");
       }
       throw std::runtime_error("fluxen: append failed");
     }
