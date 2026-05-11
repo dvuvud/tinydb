@@ -380,8 +380,9 @@ public:
     const bool write_ok =
         WriteFile(tmp, data.data(), static_cast<DWORD>(data.size()), &written,
                   nullptr) &&
-        written == static_cast<DWORD>(data.size());
-    FlushFileBuffers(tmp);
+        written == static_cast<DWORD>(data.size()) &&
+        FlushFileBuffers(tmp) != 0;
+
     CloseHandle(tmp);
 
     if (!write_ok) {
@@ -395,8 +396,9 @@ public:
       return false;
     }
     const bool write_ok = ::write(tmp_fd, data.data(), data.size()) ==
-                          static_cast<ssize_t>(data.size());
-    ::fsync(tmp_fd);
+                              static_cast<ssize_t>(data.size()) &&
+                          ::fsync(tmp_fd) == 0;
+
     ::close(tmp_fd);
 
     if (!write_ok) {
